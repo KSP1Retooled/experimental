@@ -1,19 +1,20 @@
-name: Mirror release to GitCode
+name: Mirror to GitCode
 
+# Every push mirrors the branches and tags to GitCode. A release is then
+# (re)made there for each tag that is new on GitCode or has moved, if GitHub
+# has a release for it. Release events and manual runs mirror the named
+# release whether or not its tag changed.
 on:
+  push:
+    branches: ['**']
+    tags: ['**']
   release:
     types: [published, edited]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to mirror (defaults to the latest release)
+        description: Release tag to mirror even if its tag is unchanged (optional)
         required: false
-
-# Builds re-use their release tag, so a newer run for the same tag replaces an
-# older one: the mirror starts by deleting whatever GitCode has for the tag.
-concurrency:
-  group: gitcode-mirror-${{ github.event.release.tag_name || inputs.tag || 'latest' }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -23,16 +24,56 @@ env:
   GITCODE_REPO: experimental
 
 jobs:
-  mirror:
+  # Quick: push branches and tags, and list the tags whose release must be
+  # (re)made. Those tags are left for the release job to push.
+  sync:
+    # A push that deletes a branch or tag has nothing to check out.
+    if: github.event_name != 'push' || !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One sync at a time; each one mirrors the whole current state.
+    concurrency:
+      group: gitcode-sync
+      cancel-in-progress: false
+    outputs:
+      tags: ${{ steps.sync.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the sync pushes every branch and tag.
+          fetch-depth: 0
+
+      - name: Sync repository and find releases to mirror
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The GITEEPAT secret holds the GitCode personal access token.
+          GITCODE_TOKEN: ${{ secrets.GITEEPAT }}
+          EXPLICIT_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: bash .github/scripts/gitcode-sync.sh
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.tags != '' && needs.sync.outputs.tags != '[]'
     runs-on: ubuntu-latest
     # Assets upload in parallel straight to GitCode's object storage, so a
     # release takes about as long as its largest asset. Keep the GitHub-hosted
     # 6 h ceiling as headroom until real upload speeds are known.
     timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.sync.outputs.tags) }}
+    # Builds re-use their release tag, so a newer run for the same tag
+    # replaces an older one: the mirror starts by deleting whatever GitCode
+    # has for the tag.
+    concurrency:
+      group: gitcode-release-${{ matrix.tag }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history: the mirror pushes every branch and tag.
+          # Full history: the mirror pushes the release's tag.
           fetch-depth: 0
 
       # Uploads cross a long, lossy link to China. BBR keeps throughput up
@@ -50,38 +91,18 @@ jobs:
             net.ipv4.tcp_slow_start_after_idle=0
           sysctl net.ipv4.tcp_congestion_control
 
-      - name: Resolve release tag
-        id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.tag }}
-        run: |
-          tag="${EVENT_TAG:-$INPUT_TAG}"
-          if [ -z "$tag" ]; then
-            tag=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName')
-          fi
-          if [ -z "$tag" ]; then
-            echo "::error::No release found to mirror"
-            exit 1
-          fi
-          echo "Mirroring release $tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      # One script does the whole mirror, in this order:
-      #   1. wait for the GitHub release's assets to stop changing
+      # In this order:
+      #   1. wait for the GitHub release's assets to be rebuilt and settle
       #   2. delete the GitCode release and its tag, if they exist
-      #   3. push branches and tags to GitCode (gitcode-sync.sh)
+      #   3. push the tag to GitCode
       #   4. create the GitCode release and upload every asset
       - name: Mirror release and assets
         env:
           GH_TOKEN: ${{ github.token }}
           # The GITEEPAT secret holds the GitCode personal access token.
           GITCODE_TOKEN: ${{ secrets.GITEEPAT }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          # A build replaces the release's assets one by one, so on release
-          # events wait for the asset list to settle before mirroring.
-          WAIT_FOR_ASSETS: ${{ github.event_name == 'release' }}
-        run: |
-          chmod +x .github/scripts/*.sh
-          .github/scripts/gitcode-mirror.sh
+          TAG: ${{ matrix.tag }}
+          # A build moves the tag first and replaces the assets one by one
+          # afterwards, so wait for them unless the run was started by hand.
+          WAIT_FOR_ASSETS: ${{ github.event_name != 'workflow_dispatch' }}
+        run: bash .github/scripts/gitcode-mirror.sh

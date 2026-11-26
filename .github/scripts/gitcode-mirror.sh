@@ -4,8 +4,11 @@
 # Builds here re-use their release tag: the tag moves to a new commit and the
 # release's assets are replaced. So this never updates a GitCode release in
 # place. If GitCode already has a release for the tag, the release and its tag
-# are deleted there, the tag is pushed again (gitcode-sync.sh, which this
-# script runs) and the release is made anew with every asset uploaded.
+# are deleted there, the tag is pushed again and the release is made anew
+# with every asset uploaded.
+#
+# gitcode-sync.sh decides which tags need this (new or moved ones) and leaves
+# pushing those tags to this script. Run from a full clone.
 #
 # GitCode API reference: https://docs.gitcode.com/en/docs/apis/
 #   - Releases are addressed by tag name, not by numeric id.
@@ -24,13 +27,18 @@
 #
 # Required env: GH_TOKEN, GITCODE_TOKEN, GITCODE_OWNER, GITCODE_REPO, TAG,
 #               GITHUB_REPOSITORY
-# Optional env: WAIT_FOR_ASSETS=true
+# Optional env: WAIT_FOR_ASSETS=true     wait for the build's assets first
+#               ASSET_SETTLE_MINUTES=<n> unchanged minutes required (default 20)
+#               ASSET_WAIT_MINUTES=<n>   give up waiting after (default 150)
 #               ASSET_FILTER=<regex>  only sync assets whose name matches
 #               UPLOAD_MAX_TIME=<s>   cap each upload (for throughput tests)
 #               GITCODE_MAX_PRERELEASES=<n>  prereleases kept (default 15, 0 = off)
 #               GITCODE_MAX_RELEASES=<n>     full releases kept (default 4, 0 = off)
 #               API_ATTEMPTS, GH_ATTEMPTS, UPLOAD_ATTEMPTS  override retries
 set -euo pipefail
+
+# shellcheck source=.github/scripts/gitcode-git.sh
+source "$(dirname "${BASH_SOURCE[0]}")/gitcode-git.sh"
 
 API="https://api.gitcode.com/api/v5/repos/${GITCODE_OWNER}/${GITCODE_REPO}"
 TAG_PATH=$(jq -rn --arg t "$TAG" '$t | @uri')   # tag, escaped for URL paths
@@ -136,10 +144,10 @@ delete_gitcode_release() {
   release_gone "$1"
 }
 
-# updatedAt is part of the fingerprint so that an asset replaced by one of the
-# same size still counts as a change.
+# The dates are part of the fingerprint so that an asset replaced by one of
+# the same size still counts as a change.
 asset_fingerprint() {
-  retry "$GH_ATTEMPTS" gh_release | jq -c '[.assets[] | {name, size, updatedAt}] | sort_by(.name)'
+  retry "$GH_ATTEMPTS" gh_release | jq -c '[.assets[] | {name, size, createdAt, updatedAt}] | sort_by(.name)'
 }
 
 # Print the GitCode release JSON for $TAG; fails unless GitCode returned it.
@@ -161,23 +169,48 @@ gitcode_asset() {
     | head -n1
 }
 
-# --- Wait for the asset list to stop changing -----------------------------
+# --- Fetch the tag as it is on GitHub right now ---------------------------
+gitcode_git_init
+if ! retry 3 git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"; then
+  echo "::error::Could not fetch tag $TAG from GitHub"
+  exit 1
+fi
+
+# --- Wait for the build's assets ------------------------------------------
+# A build moves the tag to a new commit first and replaces the assets one by
+# one afterwards, minutes apart. So wait until every asset is newer than the
+# tag's commit (none is left over from the previous build), and the list has
+# then not changed for ASSET_SETTLE_MINUTES, which must be longer than the
+# gap between two assets of one build.
 if [ "${WAIT_FOR_ASSETS:-false}" = "true" ]; then
-  stable_needed=5   # consecutive identical polls (1 min apart)
-  max_polls=60
-  last="" stable=0
+  stable_needed=${ASSET_SETTLE_MINUTES:-20}   # consecutive identical polls
+  max_polls=${ASSET_WAIT_MINUTES:-150}        # one poll a minute
+  tag_time=$(git log -1 --format=%ct "refs/tags/$TAG^{commit}")
+  last="" stable=0 settled=false
   for ((i = 0; i < max_polls; i++)); do
     cur=$(asset_fingerprint)
-    if [ "$cur" = "$last" ] && [ "$cur" != "[]" ]; then
+    fresh=$(jq --argjson t "$tag_time" 'length > 0 and all(.[];
+      (.createdAt | sub("\\.[0-9]+"; "") | fromdateiso8601) >= $t)' <<<"$cur")
+    if [ "$fresh" = true ] && [ "$cur" = "$last" ]; then
       stable=$((stable + 1))
     else
       stable=0
     fi
     last="$cur"
-    echo "Assets: $(jq length <<<"$cur") (stable for $stable/$stable_needed polls)"
-    [ "$stable" -ge "$stable_needed" ] && break
+    if [ "$fresh" = true ]; then
+      echo "Assets: $(jq length <<<"$cur"), all from this build (unchanged for $stable/$stable_needed min)"
+    else
+      echo "Assets: $(jq length <<<"$cur"), waiting for the build to replace them"
+    fi
+    if [ "$stable" -ge "$stable_needed" ]; then
+      settled=true
+      break
+    fi
     sleep 60
   done
+  if [ "$settled" != true ]; then
+    echo "::warning::The assets of release $TAG did not settle within $max_polls minutes; mirroring them as they are"
+  fi
 fi
 
 # --- Remove the existing GitCode release and its tag ----------------------
@@ -206,10 +239,35 @@ case $rc in
     ;;
 esac
 
-# --- Push branches and tags to GitCode ------------------------------------
-# With RECREATE_TAG the sync deletes $TAG on GitCode (if the release delete
-# above left it there) before pushing it again from GitHub.
-RECREATE_TAG=$recreate_tag "$(dirname "${BASH_SOURCE[0]}")/gitcode-sync.sh"
+# --- Push the tag to GitCode ----------------------------------------------
+# gitcode-sync.sh left this tag alone. After a release was deleted above, its
+# tag is deleted on GitCode too (if it is still there), so the tag and the
+# release made from it are both new.
+# ls-remote --exit-code returns 2 when the ref is absent; anything else that
+# is not 0 is a failed lookup, which must not be mistaken for "already gone".
+if [ "$recreate_tag" = true ]; then
+  rc=0
+  git_gitcode ls-remote --exit-code "$GITCODE_REMOTE" "refs/tags/$TAG" >/dev/null || rc=$?
+  case $rc in
+    0)
+      echo "Deleting tag $TAG on GitCode"
+      if ! retry 3 git_gitcode push "$GITCODE_REMOTE" ":refs/tags/$TAG"; then
+        echo "::error::Could not delete tag $TAG on GitCode"
+        exit 1
+      fi
+      ;;
+    2) echo "Tag $TAG is already gone from GitCode" ;;
+    *)
+      echo "::error::Could not check for tag $TAG on GitCode"
+      exit 1
+      ;;
+  esac
+fi
+echo "Pushing tag $TAG to $GITCODE_REMOTE"
+if ! retry 3 git_gitcode push --force "$GITCODE_REMOTE" "refs/tags/$TAG:refs/tags/$TAG"; then
+  echo "::error::Could not push tag $TAG to GitCode. Check that the GITEEPAT token has write access to $GITCODE_OWNER/$GITCODE_REPO, and that the repository is not a read-only pull mirror."
+  exit 1
+fi
 
 # --- Wait for the tag to be visible through GitCode's API -----------------
 # The release must be attached to a tag that already exists on GitCode. The
