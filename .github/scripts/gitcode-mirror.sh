@@ -7,8 +7,8 @@
 # are deleted there, the tag is pushed again and the release is made anew
 # with every asset uploaded.
 #
-# gitcode-sync.sh decides which tags need this (new or moved ones) and leaves
-# pushing those tags to this script. Run from a full clone.
+# gitcode-sync.sh decides which releases need this: those whose files differ
+# from the GitHub release by name or sha256. Run from a full clone.
 #
 # GitCode API reference: https://docs.gitcode.com/en/docs/apis/
 #   - Releases are addressed by tag name, not by numeric id.
@@ -27,94 +27,23 @@
 #
 # Required env: GH_TOKEN, GITCODE_TOKEN, GITCODE_OWNER, GITCODE_REPO, TAG,
 #               GITHUB_REPOSITORY
-# Optional env: WAIT_FOR_ASSETS=true     wait for the build's assets first
-#               ASSET_SETTLE_MINUTES=<n> unchanged minutes required (default 20)
-#               ASSET_WAIT_MINUTES=<n>   give up waiting after (default 150)
-#               ASSET_FILTER=<regex>  only sync assets whose name matches
+# Optional env: ASSET_FILTER=<regex>  only sync assets whose name matches
 #               UPLOAD_MAX_TIME=<s>   cap each upload (for throughput tests)
 #               GITCODE_MAX_PRERELEASES=<n>  prereleases kept (default 15, 0 = off)
 #               GITCODE_MAX_RELEASES=<n>     full releases kept (default 4, 0 = off)
 #               API_ATTEMPTS, GH_ATTEMPTS, UPLOAD_ATTEMPTS  override retries
 set -euo pipefail
 
-# shellcheck source=.github/scripts/gitcode-git.sh
-source "$(dirname "${BASH_SOURCE[0]}")/gitcode-git.sh"
+# shellcheck source=.github/scripts/gitcode-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/gitcode-lib.sh"
 
-API="https://api.gitcode.com/api/v5/repos/${GITCODE_OWNER}/${GITCODE_REPO}"
 TAG_PATH=$(jq -rn --arg t "$TAG" '$t | @uri')   # tag, escaped for URL paths
-API_ATTEMPTS=${API_ATTEMPTS:-8}
 GH_ATTEMPTS=${GH_ATTEMPTS:-5}
 UPLOAD_ATTEMPTS=${UPLOAD_ATTEMPTS:-3}
-
-# Seconds to wait before retry number $1: 15, 30, 45, then 60 each time.
-backoff() {
-  local s=$(( $1 * 15 ))
-  echo $(( s > 60 ? 60 : s ))
-}
-
-# api <METHOD> <path> [curl args...]
-# Calls the GitCode API, retrying transient failures. Prints the response
-# body. Returns 0 on 2xx, 3 on 404, 4 on any other 4xx, 1 when retries ran out.
-api() {
-  local method=$1 path=$2 attempt out code body
-  shift 2
-  for ((attempt = 1; ; attempt++)); do
-    out=$(curl -sS -X "$method" "$API$path" \
-      --url-query "access_token=$GITCODE_TOKEN" \
-      --connect-timeout 30 --max-time 300 \
-      -w '\n%{http_code}' "$@") || true
-    code=${out##*$'\n'}
-    body=${out%$'\n'*}
-    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
-    case $code in
-      2??) printf '%s' "$body"; return 0 ;;
-      404) printf '%s' "$body"; return 3 ;;
-      408 | 429 | 5?? | 000) ;;   # transient: retry
-      *) printf '%s' "$body"; return 4 ;;
-    esac
-    if (( attempt >= API_ATTEMPTS )); then
-      echo "::warning::GitCode $method $path failed after $attempt attempts (HTTP $code): ${body:0:300}" >&2
-      printf '%s' "$body"
-      return 1
-    fi
-    local wait_s
-    wait_s=$(backoff "$attempt")
-    echo "GitCode $method $path: HTTP $code; retrying in ${wait_s}s ($attempt/$API_ATTEMPTS)" >&2
-    sleep "$wait_s"
-  done
-}
-
-# retry <attempts> <command...>: re-run a command until it succeeds.
-retry() {
-  local n=$1 i wait_s
-  shift
-  for ((i = 1; ; i++)); do
-    "$@" && return 0
-    (( i >= n )) && return 1
-    wait_s=$(backoff "$i")
-    echo "'$1' failed; retrying in ${wait_s}s ($i/$n)" >&2
-    sleep "$wait_s"
-  done
-}
 
 gh_release() {
   gh release view "$TAG" -R "$GITHUB_REPOSITORY" \
     --json name,body,isPrerelease,assets
-}
-
-# The release list and tag list helpers below are used both to remove an
-# existing release and to prune old ones.
-
-# Print every GitCode release as one JSON array, or fail.
-gitcode_releases() {
-  local page out all='[]'
-  for ((page = 1; page <= 50; page++)); do
-    out=$(api GET /releases --url-query "per_page=100" --url-query "page=$page") || return 1
-    jq -e 'type == "array"' <<<"$out" >/dev/null 2>&1 || return 1
-    all=$(jq -c --argjson a "$all" '$a + . | unique_by(.tag_name)' <<<"$out")
-    if [ "$(jq length <<<"$out")" -lt 100 ]; then break; fi
-  done
-  printf '%s' "$all"
 }
 
 # True once the release list no longer contains tag $1.
@@ -144,12 +73,6 @@ delete_gitcode_release() {
   release_gone "$1"
 }
 
-# The dates are part of the fingerprint so that an asset replaced by one of
-# the same size still counts as a change.
-asset_fingerprint() {
-  retry "$GH_ATTEMPTS" gh_release | jq -c '[.assets[] | {name, size, createdAt, updatedAt}] | sort_by(.name)'
-}
-
 # Print the GitCode release JSON for $TAG; fails unless GitCode returned it.
 gitcode_release() {
   local r
@@ -176,46 +99,8 @@ if ! retry 3 git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"; then
   exit 1
 fi
 
-# --- Wait for the build's assets ------------------------------------------
-# A build moves the tag to a new commit first and replaces the assets one by
-# one afterwards, minutes apart. So wait until every asset is newer than the
-# tag's commit (none is left over from the previous build), and the list has
-# then not changed for ASSET_SETTLE_MINUTES, which must be longer than the
-# gap between two assets of one build.
-if [ "${WAIT_FOR_ASSETS:-false}" = "true" ]; then
-  stable_needed=${ASSET_SETTLE_MINUTES:-20}   # consecutive identical polls
-  max_polls=${ASSET_WAIT_MINUTES:-150}        # one poll a minute
-  tag_time=$(git log -1 --format=%ct "refs/tags/$TAG^{commit}")
-  last="" stable=0 settled=false
-  for ((i = 0; i < max_polls; i++)); do
-    cur=$(asset_fingerprint)
-    fresh=$(jq --argjson t "$tag_time" 'length > 0 and all(.[];
-      (.createdAt | sub("\\.[0-9]+"; "") | fromdateiso8601) >= $t)' <<<"$cur")
-    if [ "$fresh" = true ] && [ "$cur" = "$last" ]; then
-      stable=$((stable + 1))
-    else
-      stable=0
-    fi
-    last="$cur"
-    if [ "$fresh" = true ]; then
-      echo "Assets: $(jq length <<<"$cur"), all from this build (unchanged for $stable/$stable_needed min)"
-    else
-      echo "Assets: $(jq length <<<"$cur"), waiting for the build to replace them"
-    fi
-    if [ "$stable" -ge "$stable_needed" ]; then
-      settled=true
-      break
-    fi
-    sleep 60
-  done
-  if [ "$settled" != true ]; then
-    echo "::warning::The assets of release $TAG did not settle within $max_polls minutes; mirroring them as they are"
-  fi
-fi
-
 # --- Remove the existing GitCode release and its tag ----------------------
-# Done after the asset wait, so GitCode is without the release for as short a
-# time as possible. A release that cannot be removed stops the run: carrying
+# A release that cannot be removed stops the run: carrying
 # on would leave the old build's assets under the new build's name.
 rc=0
 gitcode_release >/dev/null || rc=$?
@@ -240,8 +125,7 @@ case $rc in
 esac
 
 # --- Push the tag to GitCode ----------------------------------------------
-# gitcode-sync.sh left this tag alone. After a release was deleted above, its
-# tag is deleted on GitCode too (if it is still there), so the tag and the
+# After a release was deleted above, its tag is deleted on GitCode too (if it is still there), so the tag and the
 # release made from it are both new.
 # ls-remote --exit-code returns 2 when the ref is absent; anything else that
 # is not 0 is a failed lookup, which must not be mistaken for "already gone".

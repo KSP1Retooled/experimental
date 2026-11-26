@@ -1,19 +1,23 @@
 name: Mirror to GitCode
 
-# Every push mirrors the branches and tags to GitCode. A release is then
-# (re)made there for each tag that is new on GitCode or has moved, if GitHub
-# has a release for it. Release events and manual runs mirror the named
-# release whether or not its tag changed.
+# Mirrors the branches and tags to GitCode, then (re)makes every release
+# there whose files differ from the GitHub release by name or sha256.
+# Releases whose files are identical are skipped, so running this again when
+# nothing changed uploads nothing.
+#
+# GitHub has no event for "a file was uploaded to a release". The closest are
+# these two: published fires when a release is first made public, edited when
+# its title, notes or other details are changed. Uploading a file to an
+# existing release fires neither, so whatever uploads the files has to start
+# this workflow when it is done (gh workflow run gitcode-mirror.yml) or edit
+# the release afterwards.
 on:
-  push:
-    branches: ['**']
-    tags: ['**']
   release:
     types: [published, edited]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to mirror even if its tag is unchanged (optional)
+        description: Release tag to mirror even if its files are identical (optional)
         required: false
 
 permissions:
@@ -24,11 +28,8 @@ env:
   GITCODE_REPO: experimental
 
 jobs:
-  # Quick: push branches and tags, and list the tags whose release must be
-  # (re)made. Those tags are left for the release job to push.
+  # Quick: push branches and tags, and list the releases whose files differ.
   sync:
-    # A push that deletes a branch or tag has nothing to check out.
-    if: github.event_name != 'push' || !github.event.deleted
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # One sync at a time; each one mirrors the whole current state.
@@ -49,7 +50,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           # The GITEEPAT secret holds the GitCode personal access token.
           GITCODE_TOKEN: ${{ secrets.GITEEPAT }}
-          EXPLICIT_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          # Only a manual run can force a release; release events rely on
+          # the file comparison like everything else.
+          EXPLICIT_TAG: ${{ inputs.tag }}
         run: bash .github/scripts/gitcode-sync.sh
 
   release:
@@ -64,9 +67,8 @@ jobs:
       fail-fast: false
       matrix:
         tag: ${{ fromJSON(needs.sync.outputs.tags) }}
-    # Builds re-use their release tag, so a newer run for the same tag
-    # replaces an older one: the mirror starts by deleting whatever GitCode
-    # has for the tag.
+    # A newer run for the same tag replaces an older one: the mirror starts
+    # by deleting whatever GitCode has for the tag.
     concurrency:
       group: gitcode-release-${{ matrix.tag }}
       cancel-in-progress: true
@@ -92,17 +94,13 @@ jobs:
           sysctl net.ipv4.tcp_congestion_control
 
       # In this order:
-      #   1. wait for the GitHub release's assets to be rebuilt and settle
-      #   2. delete the GitCode release and its tag, if they exist
-      #   3. push the tag to GitCode
-      #   4. create the GitCode release and upload every asset
+      #   1. delete the GitCode release and its tag, if they exist
+      #   2. push the tag to GitCode
+      #   3. create the GitCode release and upload every asset
       - name: Mirror release and assets
         env:
           GH_TOKEN: ${{ github.token }}
           # The GITEEPAT secret holds the GitCode personal access token.
           GITCODE_TOKEN: ${{ secrets.GITEEPAT }}
           TAG: ${{ matrix.tag }}
-          # A build moves the tag first and replaces the assets one by one
-          # afterwards, so wait for them unless the run was started by hand.
-          WAIT_FOR_ASSETS: ${{ github.event_name != 'workflow_dispatch' }}
         run: bash .github/scripts/gitcode-mirror.sh
